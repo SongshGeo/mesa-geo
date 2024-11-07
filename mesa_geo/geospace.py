@@ -10,10 +10,7 @@ import warnings
 import geopandas as gpd
 import numpy as np
 import pyproj
-from libpysal import weights
-from rtree import index
-from shapely.geometry import Point
-from shapely.prepared import prep
+from mesa.agent import AgentSet
 
 from mesa_geo.geo_base import GeoBase
 from mesa_geo.geoagent import GeoAgent
@@ -42,7 +39,6 @@ class GeoSpace(GeoBase):
             crs_from=self.crs, crs_to="epsg:4326", always_xy=True
         )
         self.warn_crs_conversion = warn_crs_conversion
-        self._agent_layer = _AgentLayer()
         self._static_layers = []
         self._total_bounds = None  # [min_x, min_y, max_x, max_y]
 
@@ -73,11 +69,11 @@ class GeoSpace(GeoBase):
         return self._transformer
 
     @property
-    def agents(self):
+    def agents(self) -> AgentSet[GeoAgent]:
         """
         Return a list of all agents in the Geospace.
         """
-        return self._agent_layer.agents
+        return self._grid.agents
 
     @property
     def layers(self) -> list[ImageLayer | RasterLayer | gpd.GeoDataFrame]:
@@ -91,12 +87,9 @@ class GeoSpace(GeoBase):
         """
         Return the bounds of the GeoSpace in [min_x, min_y, max_x, max_y] format.
         """
-        if self._total_bounds is None:
-            if len(self.agents) > 0:
-                self._update_bounds(self._agent_layer.total_bounds)
-            if len(self.layers) > 0:
-                for layer in self.layers:
-                    self._update_bounds(layer.total_bounds)
+        if self._total_bounds is None and len(self.layers) > 0:
+            for layer in self.layers:
+                self._update_bounds(layer.total_bounds)
         return self._total_bounds
 
     def _update_bounds(self, new_bounds: np.ndarray) -> None:
@@ -170,29 +163,7 @@ class GeoSpace(GeoBase):
         else:
             for agent in agents:
                 self._check_agent(agent)
-        self._agent_layer.add_agents(agents)
         self._total_bounds = None
-
-    def _recreate_rtree(self, new_agents=None):
-        """Create a new rtree index from agents geometries."""
-        self._agent_layer._recreate_rtree(new_agents)
-
-    def remove_agent(self, agent):
-        """Remove an agent from the GeoSpace."""
-        self._agent_layer.remove_agent(agent)
-        self._total_bounds = None
-
-    def get_relation(self, agent, relation):
-        """Return a list of related agents.
-
-        :param GeoAgent agent: The agent to find related agents for.
-        :param str relation: The relation to find. Must be one of 'intersects',
-            'within', 'contains', 'touches'.
-        """
-        yield from self._agent_layer.get_relation(agent, relation)
-
-    def get_intersecting_agents(self, agent):
-        return self._agent_layer.get_intersecting_agents(agent)
 
     def get_neighbors_within_distance(
         self, agent, distance, center=False, relation="intersects"
@@ -234,235 +205,3 @@ class GeoSpace(GeoBase):
         """
 
         return self._agent_layer.get_agents_as_GeoDataFrame(agent_cls)
-
-
-class _AgentLayer:
-    """
-    Layer that contains the GeoAgents. Mainly for internal usage within `GeoSpace`.
-    """
-
-    def __init__(self):
-        # neighborhood graph for touching neighbors
-        self._neighborhood = None
-        # rtree index for spatial indexing (e.g., neighbors within distance, agents at pos, etc.)
-        self._idx = None
-        self._id_to_agent = {}
-        # bounds of the layer in [min_x, min_y, max_x, max_y] format
-        # While it is possible to calculate the bounds from rtree index,
-        # total_bounds is almost always needed (e.g., for plotting), while rtree index is not.
-        # Hence we compute total_bounds separately from rtree index.
-        self._total_bounds = None
-
-    @property
-    def agents(self):
-        """
-        Return a list of all agents in the layer.
-        """
-
-        return list(self._id_to_agent.values())
-
-    @property
-    def total_bounds(self):
-        """
-        Return the bounds of the layer in [min_x, min_y, max_x, max_y] format.
-        """
-
-        if self._total_bounds is None and len(self.agents) > 0:
-            bounds = np.array([agent.geometry.bounds for agent in self.agents])
-            min_x, min_y = np.min(bounds[:, :2], axis=0)
-            max_x, max_y = np.max(bounds[:, 2:], axis=0)
-            self._total_bounds = np.array([min_x, min_y, max_x, max_y])
-        return self._total_bounds
-
-    def _get_rtree_intersections(self, geometry):
-        """
-        Calculate rtree intersections for candidate agents.
-        """
-
-        self._ensure_index()
-        if self._idx is None:
-            return []
-        else:
-            return [
-                self._id_to_agent[i] for i in self._idx.intersection(geometry.bounds)
-            ]
-
-    def _create_neighborhood(self):
-        """
-        Create a neighborhood graph of all agents.
-        """
-
-        agents = self.agents
-        geometries = [agent.geometry for agent in agents]
-        self._neighborhood = weights.contiguity.Queen.from_iterable(geometries)
-        self._neighborhood.agents = agents
-        self._neighborhood.idx = {}
-        for agent, key in zip(agents, self._neighborhood.neighbors.keys()):
-            self._neighborhood.idx[agent] = key
-
-    def _ensure_index(self):
-        """
-        Ensure that the rtree index is created.
-        """
-
-        if self._idx is None:
-            self._recreate_rtree()
-
-    def _recreate_rtree(self, new_agents=None):
-        """
-        Create a new rtree index from agents geometries.
-        """
-
-        if new_agents is None:
-            new_agents = []
-        agents = list(self.agents) + new_agents
-
-        if len(agents) > 0:
-            # Bulk insert agents
-            index_data = (
-                (agent.unique_id, agent.geometry.bounds, None) for agent in agents
-            )
-            self._idx = index.Index(index_data)
-
-    def add_agents(self, agents):
-        """
-        Add a list of GeoAgents to the layer without checking their crs.
-
-        GeoAgents must have the same crs to avoid incorrect spatial indexing results.
-        To change the crs of a GeoAgent, use `GeoAgent.to_crs()` method. Refer to
-        `GeoSpace._check_agent()` as an example.
-        This function may also be called with a single GeoAgent.
-
-        :param agents: A list of GeoAgents or a single GeoAgent to be added into the layer.
-        """
-
-        if isinstance(agents, GeoAgent):
-            agent = agents
-            self._id_to_agent[agent.unique_id] = agent
-            if self._idx:
-                self._idx.insert(agent.unique_id, agent.geometry.bounds, None)
-        else:
-            for agent in agents:
-                self._id_to_agent[agent.unique_id] = agent
-            if self._idx:
-                self._recreate_rtree(agents)
-        self._total_bounds = None
-
-    def remove_agent(self, agent):
-        """
-        Remove an agent from the layer.
-        """
-
-        del self._id_to_agent[agent.unique_id]
-        if self._idx:
-            self._idx.delete(agent.unique_id, agent.geometry.bounds)
-        self._total_bounds = None
-
-    def get_relation(self, agent, relation):
-        """Return a list of related agents.
-
-        Args:
-            agent: the agent for which to compute the relation
-            relation: must be one of 'intersects', 'within', 'contains',
-                'touches'
-            other_agents: A list of agents to compare against.
-                Omit to compare against all other agents of the layer.
-        """
-
-        self._ensure_index()
-        possible_agents = self._get_rtree_intersections(agent.geometry)
-        for other_agent in possible_agents:
-            if (
-                getattr(agent.geometry, relation)(other_agent.geometry)
-                and other_agent.unique_id != agent.unique_id
-            ):
-                yield other_agent
-
-    def get_intersecting_agents(self, agent):
-        self._ensure_index()
-        intersecting_agents = self.get_relation(agent, "intersects")
-        return intersecting_agents
-
-    def get_neighbors_within_distance(
-        self, agent, distance, center=False, relation="intersects"
-    ):
-        """Return a list of agents within `distance` of `agent`.
-
-        Distance is measured as a buffer around the agent's geometry,
-        set center=True to calculate distance from center.
-        """
-        self._ensure_index()
-        if center:
-            geometry = agent.geometry.centroid.buffer(distance)
-        else:
-            geometry = agent.geometry.buffer(distance)
-        possible_neighbors = self._get_rtree_intersections(geometry)
-        prepared_geometry = prep(geometry)
-        for other_agent in possible_neighbors:
-            if getattr(prepared_geometry, relation)(other_agent.geometry):
-                yield other_agent
-
-    def agents_at(self, pos):
-        """
-        Return a generator of agents at given pos.
-        """
-
-        self._ensure_index()
-        if not isinstance(pos, Point):
-            pos = Point(pos)
-
-        possible_agents = self._get_rtree_intersections(pos)
-        for other_agent in possible_agents:
-            if pos.within(other_agent.geometry):
-                yield other_agent
-
-    def distance(self, agent_a, agent_b):
-        """
-        Return distance of two agents.
-        """
-
-        return agent_a.geometry.distance(agent_b.geometry)
-
-    def get_neighbors(self, agent):
-        """
-        Get (touching) neighbors of an agent.
-        """
-
-        if not self._neighborhood or self._neighborhood.agents != self.agents:
-            self._create_neighborhood()
-
-        if self._neighborhood is None:
-            return []
-        else:
-            idx = self._neighborhood.idx[agent]
-            neighbors_idx = self._neighborhood.neighbors[idx]
-            neighbors = [self.agents[i] for i in neighbors_idx]
-            return neighbors
-
-    def get_agents_as_GeoDataFrame(self, agent_cls=GeoAgent) -> gpd.GeoDataFrame:
-        """
-        Extract GeoAgents as a GeoDataFrame.
-
-        :param agent_cls: The class of the GeoAgents to extract. Default is `GeoAgent`.
-        :return: A GeoDataFrame of the GeoAgents.
-        :rtype: geopandas.GeoDataFrame
-        """
-
-        agents_list = []
-        crs = None
-        for agent in self.agents:
-            if isinstance(agent, agent_cls):
-                crs = agent.crs
-                agent_dict = {
-                    attr: value
-                    for attr, value in vars(agent).items()
-                    if attr not in {"model", "pos", "_crs"}
-                }
-                agents_list.append(agent_dict)
-        agents_gdf = gpd.GeoDataFrame.from_records(agents_list)
-        # workaround for geometry column not being set in `from_records`
-        # see https://github.com/geopandas/geopandas/issues/3152
-        # may be removed when the issue is resolved
-        agents_gdf.set_geometry("geometry", inplace=True)
-        agents_gdf.crs = crs
-        return agents_gdf

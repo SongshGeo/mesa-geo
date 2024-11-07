@@ -8,15 +8,23 @@ from __future__ import annotations
 import copy
 import itertools
 import math
-from collections.abc import Callable, Iterable, Iterator, Sequence
-from typing import Any, cast, overload
+import warnings
+from collections.abc import Callable, Iterable, Iterator
+from functools import cached_property
+from typing import TypeVar
 
 import numpy as np
 import rasterio as rio
 from affine import Affine
 from mesa import Model
-from mesa.agent import Agent
-from mesa.space import Coordinate, accept_tuple_argument
+from mesa.experimental.cell_space.cell import Cell, CellCollection
+from mesa.experimental.cell_space.grid import (
+    Grid,
+    OrthogonalMooreGrid,
+    OrthogonalVonNeumannGrid,
+)
+from mesa.space import Coordinate, PropertyLayer, accept_tuple_argument
+from numpy.typing import NDArray
 from rasterio.warp import (
     Resampling,
     calculate_default_transform,
@@ -25,6 +33,8 @@ from rasterio.warp import (
 )
 
 from mesa_geo.geo_base import GeoBase
+
+T = TypeVar("T", bound=Cell)
 
 
 class RasterBase(GeoBase):
@@ -156,32 +166,6 @@ class RasterBase(GeoBase):
         return x < 0 or x >= self.width or y < 0 or y >= self.height
 
 
-class Cell(Agent):
-    """
-    Cells are containers of raster attributes, and are building blocks of `RasterLayer`.
-    """
-
-    pos: Coordinate | None
-    indices: Coordinate | None
-
-    def __init__(self, model, pos=None, indices=None):
-        """
-        Initialize a cell.
-
-        :param pos: Position of the cell in (x, y) format.
-            Origin is at lower left corner of the grid
-        :param indices: Indices of the cell in (row, col) format.
-            Origin is at upper left corner of the grid
-        """
-
-        super().__init__(model)
-        self.pos = pos
-        self.indices = indices
-
-    def step(self):
-        pass
-
-
 class RasterLayer(RasterBase):
     """
     Some methods in `RasterLayer` are copied from `mesa.space.Grid`, including:
@@ -214,103 +198,83 @@ class RasterLayer(RasterBase):
     whereas it is `self.cells: List[List[Cell]]` here in `RasterLayer`.
     """
 
-    cells: list[list[Cell]]
-    _neighborhood_cache: dict[Any, list[Coordinate]]
-    _attributes: set[str]
-
     def __init__(
-        self, width, height, crs, total_bounds, model, cell_cls: type[Cell] = Cell
+        self,
+        width,
+        height,
+        crs,
+        total_bounds,
+        model,
+        cell_cls: type[Cell] = Cell,
+        moore: bool = False,
     ):
-        super().__init__(width, height, crs, total_bounds)
+        RasterBase.__init__(self, width, height, crs, total_bounds)
         self.model = model
         self.cell_cls = cell_cls
-        self._setup_cells()
-        self._attributes = set()
-        self._neighborhood_cache = {}
+        self._setup_grid(width, height, moore=moore, cell_cls=cell_cls)
 
-    def _setup_cells(self) -> None:
-        self.cells = []
-        for x in range(self.width):
-            col: list[self.cell_cls] = []
-            for y in range(self.height):
-                row_idx, col_idx = self.height - y - 1, x
-                col.append(
-                    self.cell_cls(self.model, pos=(x, y), indices=(row_idx, col_idx))
-                )
-            self.cells.append(col)
+    def _setup_grid(
+        self,
+        width: int,
+        height: int,
+        moore: bool,
+        cell_cls: type[Cell],
+        **kwargs,
+    ):
+        grid_cls = OrthogonalMooreGrid if moore else OrthogonalVonNeumannGrid
+        self._grid: Grid = grid_cls(
+            dimensions=(width, height),
+            cell_klass=cell_cls,
+            **kwargs,
+        )
+        self._moore = moore
 
     @property
-    def attributes(self) -> set[str]:
-        """
-        Return the attributes of the cells in the raster layer.
+    def shape(self) -> tuple[int, int]:
+        """Return the shape of the raster layer."""
+        return self.height, self.width
 
-        :return: Attributes of the cells in the raster layer.
-        :rtype: Set[str]
-        """
-        return self._attributes
+    @property
+    def grid(self) -> Grid | None:
+        """Return the grid of the raster layer."""
+        return getattr(self, "_grid", None)
 
-    @overload
-    def __getitem__(self, index: int) -> list[Cell]: ...
+    @property
+    def cells(self) -> CellCollection:
+        """Return all cells in the raster layer."""
+        return self.grid.all_cells
 
-    @overload
-    def __getitem__(
-        self, index: tuple[int | slice, int | slice]
-    ) -> Cell | list[Cell]: ...
+    @cached_property
+    def array_cells(self) -> NDArray[T]:
+        """Return all cells in the raster layer as a 2D numpy array."""
+        array = np.empty(shape=self.shape, dtype=object)
+        for cell in self.cells:
+            x, y = cell.coordinate
+            array[self.height - y - 1, x] = cell
+        return array
 
-    @overload
-    def __getitem__(self, index: Sequence[Coordinate]) -> list[Cell]: ...
+    @property
+    def attributes(self) -> list[str]:
+        """Return the names of all attributes in the raster layer."""
+        return list(self.grid.property_layers.keys())
 
-    def __getitem__(
-        self, index: int | Sequence[Coordinate] | tuple[int | slice, int | slice]
-    ) -> Cell | list[Cell]:
+    def __getitem__(self, index) -> Cell | CellCollection:
         """
         Access contents from the grid.
         """
-
-        if isinstance(index, int):
-            # cells[x]
-            return self.cells[index]
-
-        if isinstance(index[0], tuple):
-            # cells[(x1, y1), (x2, y2)]
-            index = cast(Sequence[Coordinate], index)
-
-            cells = []
-            for pos in index:
-                x1, y1 = pos
-                cells.append(self.cells[x1][y1])
-            return cells
-
-        x, y = index
-
-        if isinstance(x, int) and isinstance(y, int):
-            # cells[x, y]
-            x, y = cast(Coordinate, index)
-            return self.cells[x][y]
-
-        if isinstance(x, int):
-            # cells[x, :]
-            x = slice(x, x + 1)
-
-        if isinstance(y, int):
-            # grid[:, y]
-            y = slice(y, y + 1)
-
-        # cells[:, :]
-        x, y = (cast(slice, x), cast(slice, y))
-        cells = []
-        for rows in self.cells[x]:
-            for cell in rows[y]:
-                cells.append(cell)
-        return cells
+        selected = self.array_cells[index]
+        return (
+            selected
+            if isinstance(selected, Cell)
+            else CellCollection(selected.flatten())
+        )
 
     def __iter__(self) -> Iterator[Cell]:
         """
         Create an iterator that chains the rows of the cells together
         as if it is one list
         """
-
-        return itertools.chain(*self.cells)
+        return itertools.chain(self.cells)
 
     def coord_iter(self) -> Iterator[tuple[Cell, int, int]]:
         """
@@ -319,7 +283,31 @@ class RasterLayer(RasterBase):
 
         for row in range(self.width):
             for col in range(self.height):
-                yield self.cells[row][col], row, col  # cell, x, y
+                yield self.cells[row, col], row, col  # cell, x, y
+
+    def add_property(
+        self,
+        data: np.ndarray | float | int | bool,
+        attr_name: str,
+        add_to_cells: bool = True,
+    ) -> None:
+        """Add a property layer to the grid."""
+        if isinstance(data, np.ndarray):
+            if data.shape != (self.height, self.width):
+                raise ValueError(
+                    f"Data shape does not match raster shape. "
+                    f"Expected {(self.height, self.width)}, received {data.shape}."
+                )
+        else:
+            data = np.full((self.height, self.width), data)
+        property_layer = PropertyLayer(
+            attr_name,
+            self.width,
+            self.height,
+            default_value=np.nan,
+        )
+        property_layer.data = data
+        self.grid.add_property_layer(property_layer, add_to_cells)
 
     def apply_raster(self, data: np.ndarray, attr_name: str | None = None) -> None:
         """
@@ -330,18 +318,11 @@ class RasterLayer(RasterBase):
             If None, a random name will be generated. Default is None.
         :raises ValueError: If the shape of the data is not (1, height, width).
         """
-
-        if data.shape != (1, self.height, self.width):
-            raise ValueError(
-                f"Data shape does not match raster shape. "
-                f"Expected {(1, self.height, self.width)}, received {data.shape}."
-            )
-        if attr_name is None:
-            attr_name = f"attribute_{len(self.cell_cls.__dict__)}"
-        self._attributes.add(attr_name)
-        for x in range(self.width):
-            for y in range(self.height):
-                setattr(self.cells[x][y], attr_name, data[0, self.height - y - 1, x])
+        warnings.warn(
+            "This method is deprecated. Use `add_property` instead.",
+            stacklevel=2,
+        )
+        self.add_property(data, attr_name)
 
     def get_raster(self, attr_name: str | None = None) -> np.ndarray:
         """
@@ -358,18 +339,8 @@ class RasterLayer(RasterBase):
                 f"Attribute {attr_name} does not exist. "
                 f"Choose from {self.attributes}, or set `attr_name` to `None` to retrieve all."
             )
-        if attr_name is None:
-            num_bands = len(self.attributes)
-            attr_names = self.attributes
-        else:
-            num_bands = 1
-            attr_names = {attr_name}
-        data = np.empty((num_bands, self.height, self.width))
-        for ind, name in enumerate(attr_names):
-            for x in range(self.width):
-                for y in range(self.height):
-                    data[ind, self.height - y - 1, x] = getattr(self.cells[x][y], name)
-        return data
+        attr_names = self.attributes if attr_name is None else {attr_name}
+        return np.stack([self.grid.property_layers[attr].data for attr in attr_names])
 
     def iter_neighborhood(
         self,
@@ -465,31 +436,11 @@ class RasterLayer(RasterBase):
         include_center: bool = False,
         radius: int = 1,
     ) -> list[Coordinate]:
-        cache_key = (pos, moore, include_center, radius)
-        neighborhood = self._neighborhood_cache.get(cache_key, None)
-
-        if neighborhood is None:
-            coordinates: set[Coordinate] = set()
-
-            x, y = pos
-            for dy in range(-radius, radius + 1):
-                for dx in range(-radius, radius + 1):
-                    if dx == 0 and dy == 0 and not include_center:
-                        continue
-                    # Skip coordinates that are outside manhattan distance
-                    if not moore and abs(dx) + abs(dy) > radius:
-                        continue
-
-                    coord = (x + dx, y + dy)
-
-                    if self.out_of_bounds(coord):
-                        continue
-                    coordinates.add(coord)
-
-            neighborhood = sorted(coordinates)
-            self._neighborhood_cache[cache_key] = neighborhood
-
-        return neighborhood
+        """
+        Get neighboring cell coordinates of a certain point.
+        """
+        cells = self.get_neighboring_cells(pos, moore, include_center, radius)
+        return [cell.coordinate for cell in cells]
 
     def get_neighboring_cells(
         self,
@@ -497,9 +448,17 @@ class RasterLayer(RasterBase):
         moore: bool,
         include_center: bool = False,
         radius: int = 1,
-    ) -> list[Cell]:
-        neighboring_cell_idx = self.get_neighborhood(pos, moore, include_center, radius)
-        return [self.cells[idx[0]][idx[1]] for idx in neighboring_cell_idx]
+    ) -> CellCollection:
+        """
+        Get neighboring cells of a certain point.
+        """
+        if moore != self._moore:
+            raise NotImplementedError(
+                "Only the same type of neighborhood is supported."
+            )
+        return self[pos[0], pos[1]].get_neighborhood(
+            radius=radius, include_center=include_center
+        )
 
     def to_crs(self, crs, inplace=False) -> RasterLayer | None:
         super()._to_crs_check(crs)

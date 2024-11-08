@@ -331,3 +331,5 @@ pip-log.txt
 mesa_geo/visualization/templates/css/*
 mesa_geo/visualization/templates/js/*
 !mesa_geo/visualization/templates/js/MapModule.js
+
+playground.ipynb

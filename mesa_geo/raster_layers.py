@@ -214,7 +214,6 @@ class RasterLayer(RasterBase):
     whereas it is `self.cells: List[List[Cell]]` here in `RasterLayer`.
     """
 
-    cells: list[list[Cell]]
     _neighborhood_cache: dict[Any, list[Coordinate]]
     _attributes: set[str]
 
@@ -224,16 +223,24 @@ class RasterLayer(RasterBase):
         super().__init__(width, height, crs, total_bounds)
         self.model = model
         self.cell_cls = cell_cls
-        self.cells = []
-        for x in range(self.width):
-            col: list[cell_cls] = []
-            for y in range(self.height):
-                row_idx, col_idx = self.height - y - 1, x
-                col.append(self.cell_cls(model, pos=(x, y), indices=(row_idx, col_idx)))
-            self.cells.append(col)
-
+        self._setup_cells()
         self._attributes = set()
         self._neighborhood_cache = {}
+
+    def _setup_cells(self):
+        self._cells = []
+        for x in range(self.width):
+            col: list[self.cell_cls] = []
+            for y in range(self.height):
+                row_idx, col_idx = self.height - y - 1, x
+                col.append(
+                    self.cell_cls(self.model, pos=(x, y), indices=(row_idx, col_idx))
+                )
+            self._cells.append(col)
+
+    @property
+    def cells(self) -> list[list[Cell]]:
+        return self._cells
 
     @property
     def attributes(self) -> set[str]:
